@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "*** starting dbus-bluenova ***"
+exec 2>&1
+exec python3 /data/bluenova/dbus_bluenova.py /dev/TTY

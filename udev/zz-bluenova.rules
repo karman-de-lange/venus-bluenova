@@ -1,0 +1,5 @@
+# This FTDI adapter is the BlueNova RS485 link. serial-starter starts one
+# driver for it, on whatever tty name the kernel assigns.
+# This file is read after serial-starter.rules, which would otherwise treat
+# every FT232R as a generic RS485 probe list.
+ACTION=="add", SUBSYSTEM=="tty", ENV{ID_SERIAL_SHORT}=="AG0KFRQ1", ENV{VE_SERVICE}:="bluenova"
