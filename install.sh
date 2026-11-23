@@ -46,11 +46,31 @@ fi
 EOF
 chmod 755 /data/rc.local
 
+# Reload the rule table only. Do not restart serial-starter and do not
+# synthesize an add event: both make it claim a port again. The other
+# ports on a GX are the built-in VE.Direct MPPT and the USB TTL MPPT.
 udevadm control --reload-rules
-# serial-starter reads its service list once, at start.
-svc -t /service/serial-starter || true
-sleep 2
-if [ -c /dev/ttyUSB0 ]; then
-    udevadm trigger --action=add --name-match=ttyUSB0 || true
+
+# This adapter only. Stop the generic probe serial-starter already started
+# on it, then supervise the BlueNova driver ourselves. The running
+# serial-starter keeps the locks on the other ttys and is left alone.
+id=$(echo /dev/serial/by-id/*AG0KFRQ1*)
+if [ -e "$id" ]; then
+    adapter=$(realpath "$id")
+    tty=$(basename "$adapter")
+    /opt/victronenergy/serial-starter/stop-tty.sh "$tty"
+    rm -f "/dev/serial-starter/$tty"
+
+    name="dbus-bluenova.$tty"
+    svc -d "/service/$name" 2>/dev/null || true
+    rm -f "/service/$name"
+    rm -rf "/var/volatile/services/$name"
+    mkdir -p /var/volatile/services
+    cp -a /opt/victronenergy/service-templates/dbus-bluenova \
+        "/var/volatile/services/$name"
+    sed -i "s:TTY:$tty:g" \
+        "/var/volatile/services/$name/run" \
+        "/var/volatile/services/$name/log/run"
+    ln -s "/var/volatile/services/$name" "/service/$name"
 fi
 echo "installed"
