@@ -393,90 +393,62 @@ def level_name(value):
 
 
 def decode_pylon_analog(info):
-    """Return a dict when the payload matches the usual 42H analog layout."""
-    for skip in (1, 0):
-        body = info[skip:]
-        if len(body) < 4:
-            continue
-        module_count = body[0]
-        cell_count = body[1]
-        if not (1 <= cell_count <= 16 and module_count <= 16):
-            cell_count = body[0]
-            offset = 1
-            if not 1 <= cell_count <= 16:
-                continue
-        else:
-            offset = 2
-        need = offset + cell_count * 2
-        if len(body) < need + 1:
-            continue
-        cells = []
-        for index in range(cell_count):
-            pos = offset + index * 2
-            cells.append((body[pos] << 8) | body[pos + 1])
-        if any(cell < 2000 or cell > 4500 for cell in cells):
-            continue
-        cursor = offset + cell_count * 2
-        if cursor >= len(body):
-            continue
-        temp_count = body[cursor]
-        cursor += 1
-        if temp_count > 8 or cursor + temp_count * 2 + 4 > len(body):
-            continue
-        temps = []
-        for _ in range(temp_count):
-            raw = (body[cursor] << 8) | body[cursor + 1]
-            cursor += 2
-            temps.append(round((signed16(raw) - 2730) / 10.0, 1))
-        if cursor + 4 > len(body):
-            continue
-        current = signed16((body[cursor] << 8) | body[cursor + 1]) / 100.0
+    """CID2 0x42 for this rack. One layout, walked from the count bytes.
+
+    Byte 0 is the address echo. Byte 1 is the cell count. There is no
+    module-count byte in front of that. The byte after remaining capacity
+    is one fixed byte, not a length.
+    """
+    if len(info) < 4:
+        return None
+    cell_count = info[1]
+    cursor = 2
+    if cell_count < 1 or cursor + cell_count * 2 >= len(info):
+        return None
+    cells = []
+    for _ in range(cell_count):
+        cells.append((info[cursor] << 8) | info[cursor + 1])
         cursor += 2
-        voltage_raw = (body[cursor] << 8) | body[cursor + 1]
+    temp_count = info[cursor]
+    cursor += 1
+    # current, voltage, remain, the fixed byte, full, cycles, SOC, SOH
+    tail = temp_count * 2 + 13
+    if cursor + tail > len(info):
+        return None
+    temps = []
+    for _ in range(temp_count):
+        raw = (info[cursor] << 8) | info[cursor + 1]
         cursor += 2
-        # Under 10000 the rack is reporting 10 mV steps (52.62 V is 0x148E).
-        voltage = voltage_raw / 100.0 if voltage_raw < 10000 else voltage_raw / 1000.0
-        # A one-byte shift still leaves a few values inside the cell range.
-        # The pack voltage is the sum of the cells, so the shift cannot pass.
-        if abs(sum(cells) / 1000.0 - voltage) > 1.5:
-            continue
-        remain = None
-        full = None
-        cycles = None
-        soc = None
-        soh = None
-        if cursor + 2 <= len(body):
-            remain = ((body[cursor] << 8) | body[cursor + 1]) / 100.0
-            cursor += 2
-        if cursor < len(body):
-            cursor += 1  # user-defined count
-        if cursor + 2 <= len(body):
-            full = ((body[cursor] << 8) | body[cursor + 1]) / 100.0
-            cursor += 2
-        if cursor + 2 <= len(body):
-            cycles = (body[cursor] << 8) | body[cursor + 1]
-            cursor += 2
-        if cursor < len(body) and body[cursor] <= 100:
-            soc = body[cursor]
-            cursor += 1
-        if cursor < len(body) and body[cursor] <= 100:
-            soh = body[cursor]
-        return {
-            "protocol": "Pylon/Pace ASCII",
-            "current": current,
-            "voltage": voltage,
-            "soc": soc,
-            "soh": soh,
-            "remain_ah": remain,
-            "full_ah": full,
-            "cycles": cycles,
-            "cells": [(index + 1, millivolts) for index, millivolts in enumerate(cells)],
-            "temps": temps,
-            "warnings": [],
-            "protections": [],
-            "status": [],
-        }
-    return None
+        temps.append(round((signed16(raw) - 2730) / 10.0, 1))
+    current = signed16((info[cursor] << 8) | info[cursor + 1]) / 100.0
+    cursor += 2
+    voltage_raw = (info[cursor] << 8) | info[cursor + 1]
+    cursor += 2
+    # Under 10000 the rack is reporting 10 mV steps (52.62 V is 0x148E).
+    voltage = voltage_raw / 100.0 if voltage_raw < 10000 else voltage_raw / 1000.0
+    remain = ((info[cursor] << 8) | info[cursor + 1]) / 100.0
+    cursor += 3
+    full = ((info[cursor] << 8) | info[cursor + 1]) / 100.0
+    cursor += 2
+    cycles = (info[cursor] << 8) | info[cursor + 1]
+    cursor += 2
+    soc = info[cursor]
+    soh = info[cursor + 1]
+    return {
+        "protocol": "Pylon/Pace ASCII",
+        "current": current,
+        "voltage": voltage,
+        "soc": soc,
+        "soh": soh,
+        "remain_ah": remain,
+        "full_ah": full,
+        "cycles": cycles,
+        "cells": [(index + 1, millivolts) for index, millivolts in enumerate(cells)],
+        "temps": temps,
+        "warnings": [],
+        "protections": [],
+        "status": [],
+    }
 
 
 def decode_pylon_alarm(info):
