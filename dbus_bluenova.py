@@ -20,10 +20,6 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python")
 
-from dbus.mainloop.glib import DBusGMainLoop
-from gi.repository import GLib
-from vedbus import VeDbusService
-
 import pylon
 
 VERSION = "1.0"
@@ -35,12 +31,84 @@ FAILS_BEFORE_DOWN = 3
 POLL_MS = 1000
 
 log = logging.getLogger("bluenova")
-# A soft 0x51 miss repeats every poll until the pack answers. Warn once.
-_identity_miss_logged = False
 
 
 def blocked(states, codes):
     return any(state in codes for state in states)
+
+
+def device_instance():
+    path = "/data/bluenova/device-instance"
+    try:
+        with open(path, encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        os.makedirs("/data/bluenova", exist_ok=True)
+        with open(path, "w", encoding="ascii") as handle:
+            handle.write("0\n")
+        return 0
+
+
+def publications(analog, alarm):
+    """dbus writes for one reading.
+
+    A missing or empty alarm stops before any limit. MaxChargeVoltage is what
+    makes Venus select this service, and a discharge current of 0 turns the
+    inverter off, so the currents are written first.
+    """
+    voltage = analog["voltage"]
+    current = analog["current"]
+    remain = analog["remain_ah"]
+    full = analog["full_ah"]
+    writes = [
+        ("/Dc/0/Voltage", round(voltage, 2)),
+        ("/Dc/0/Current", round(current, 2)),
+        ("/Dc/0/Power", round(voltage * current, 1)),
+        ("/Soc", int(analog["soc"])),
+        ("/Soh", int(analog["soh"])),
+        ("/Capacity", round(remain, 2)),
+        ("/InstalledCapacity", round(full, 2)),
+        ("/ConsumedAmphours", round(max(0.0, full - remain), 2)),
+        ("/History/ChargeCycles", int(analog["cycles"])),
+    ]
+    millivolts = [value for _, value in analog["cells"]]
+    for index, value in analog["cells"]:
+        if 1 <= index <= 16:
+            writes.append((f"/Voltages/Cell{index}", round(value / 1000.0, 3)))
+    if millivolts:
+        writes.append(("/System/MinCellVoltage", round(min(millivolts) / 1000.0, 3)))
+        writes.append(("/System/MaxCellVoltage", round(max(millivolts) / 1000.0, 3)))
+    probes = analog["temps"][:4]
+    if probes:
+        writes.append(("/Dc/0/Temperature", round(max(probes), 1)))
+        writes.append(("/System/MinCellTemperature", round(min(probes), 1)))
+        writes.append(("/System/MaxCellTemperature", round(max(probes), 1)))
+    writes.append(("/Connected", 1))
+    if alarm is None or not alarm.get("cells"):
+        return writes
+    cells = alarm["cells"]
+    temps = alarm["temps"]
+    cell_high = blocked(cells, (0x02, 0xF0))
+    cell_low = blocked(cells, (0x01, 0xF0))
+    temp_high = blocked(temps, (0x02, 0xF0))
+    temp_low = blocked(temps, (0x01, 0xF0))
+    charge_block = cell_high or temp_high
+    discharge_block = cell_low or temp_low
+    writes.extend(
+        (
+            ("/Io/AllowToCharge", 0 if charge_block else 1),
+            ("/Io/AllowToDischarge", 0 if discharge_block else 1),
+            ("/Info/MaxChargeCurrent", 0 if charge_block else CHARGE_CURRENT),
+            ("/Info/MaxDischargeCurrent", 0 if discharge_block else DISCHARGE_CURRENT),
+            ("/Info/BatteryLowVoltage", LOW_VOLTAGE),
+            ("/Info/MaxChargeVoltage", CHARGE_VOLTAGE),
+            ("/Alarms/HighCellVoltage", 2 if cell_high else 0),
+            ("/Alarms/LowCellVoltage", 2 if cell_low else 0),
+            ("/Alarms/HighTemperature", 2 if temp_high else 0),
+            ("/Alarms/LowTemperature", 2 if temp_low else 0),
+        )
+    )
+    return writes
 
 
 def cell_summary(cells):
@@ -55,35 +123,26 @@ def cell_summary(cells):
 
 
 class Battery:
-    def __init__(self, port):
+    def __init__(self, port, service, instance):
         self.port = port
         self.fd = None
         self.fails = 0
         self.named = False
         self.ticks = 0
-        name = "com.victronenergy.battery." + os.path.basename(port)
-        self.service = VeDbusService(name, register=False)
+        # A soft 0x51 miss repeats every poll until the pack answers. Warn once.
+        self._identity_miss_logged = False
+        self.service = service
+        self.instance = instance
         self._add_paths()
         self.service.register()
-        log.info("registered %s", name)
-
-    def _instance(self):
-        path = "/data/bluenova/device-instance"
-        try:
-            with open(path, encoding="ascii") as handle:
-                return int(handle.read().strip())
-        except (OSError, ValueError):
-            os.makedirs("/data/bluenova", exist_ok=True)
-            with open(path, "w", encoding="ascii") as handle:
-                handle.write("0\n")
-            return 0
+        log.info("registered %s", "com.victronenergy.battery." + os.path.basename(port))
 
     def _add_paths(self):
         add = self.service.add_path
         add("/Mgmt/ProcessName", "dbus-bluenova")
         add("/Mgmt/ProcessVersion", VERSION)
         add("/Mgmt/Connection", "RS485 " + self.port)
-        add("/DeviceInstance", self._instance())
+        add("/DeviceInstance", self.instance)
         add("/ProductId", 0xBA77)
         add("/ProductName", "BlueNova RacPower")
         add("/FirmwareVersion", "0x21")
@@ -152,15 +211,13 @@ class Battery:
         return None
 
     def apply_name(self):
-        # Called after measurements are on dbus. A missed name must not look
-        # like a dead link or undo that publish.
-        global _identity_miss_logged
+        # A missed name must not look like a dead link or undo the measurements.
         try:
             frame = self.ask(0x51)
             found = pylon.decode_identity(frame["info"]) if frame else None
             if not found:
-                if not _identity_miss_logged:
-                    _identity_miss_logged = True
+                if not self._identity_miss_logged:
+                    self._identity_miss_logged = True
                     log.warning("identity reply missing or did not decode")
                 return
             model, project, maker = found
@@ -174,54 +231,8 @@ class Battery:
             log.warning("identity read failed: %s", exc)
 
     def apply(self, analog, alarm):
-        voltage = analog["voltage"]
-        current = analog["current"]
-        remain = analog["remain_ah"]
-        full = analog["full_ah"]
-        self._set("/Dc/0/Voltage", round(voltage, 2))
-        self._set("/Dc/0/Current", round(current, 2))
-        self._set("/Dc/0/Power", round(voltage * current, 1))
-        self._set("/Soc", int(analog["soc"]))
-        self._set("/Soh", int(analog["soh"]))
-        self._set("/Capacity", round(remain, 2))
-        self._set("/InstalledCapacity", round(full, 2))
-        self._set("/ConsumedAmphours", round(max(0.0, full - remain), 2))
-        self._set("/History/ChargeCycles", int(analog["cycles"]))
-        millivolts = [value for _, value in analog["cells"]]
-        # Paths exist only for cells 1..16. A longer count must not KeyError.
-        for index, value in analog["cells"]:
-            if 1 <= index <= 16:
-                self._set(f"/Voltages/Cell{index}", round(value / 1000.0, 3))
-        if millivolts:
-            self._set("/System/MinCellVoltage", round(min(millivolts) / 1000.0, 3))
-            self._set("/System/MaxCellVoltage", round(max(millivolts) / 1000.0, 3))
-        probes = analog["temps"][:4]
-        if probes:
-            self._set("/Dc/0/Temperature", round(max(probes), 1))
-            self._set("/System/MinCellTemperature", round(min(probes), 1))
-            self._set("/System/MaxCellTemperature", round(max(probes), 1))
-        self._set("/Connected", 1)
-        # No decoded states is not a healthy pack. Leave limits and alarm
-        # paths alone so startup stays invalid and a gap cannot command 0 A.
-        if alarm is None or not alarm.get("cells"):
-            return
-        cells = alarm["cells"]
-        temps = alarm["temps"]
-        charge_block = blocked(cells, (0x02, 0xF0)) or blocked(temps, (0x02, 0xF0))
-        discharge_block = blocked(cells, (0x01, 0xF0)) or blocked(temps, (0x01, 0xF0))
-        self._set("/Io/AllowToCharge", 0 if charge_block else 1)
-        self._set("/Io/AllowToDischarge", 0 if discharge_block else 1)
-        # Currents first. Venus starts using this service as the BMS when
-        # MaxChargeVoltage becomes valid, and a discharge current of 0 turns
-        # the inverter off.
-        self._set("/Info/MaxChargeCurrent", 0 if charge_block else CHARGE_CURRENT)
-        self._set("/Info/MaxDischargeCurrent", 0 if discharge_block else DISCHARGE_CURRENT)
-        self._set("/Info/BatteryLowVoltage", LOW_VOLTAGE)
-        self._set("/Info/MaxChargeVoltage", CHARGE_VOLTAGE)
-        self._set("/Alarms/HighCellVoltage", 2 if blocked(cells, (0x02, 0xF0)) else 0)
-        self._set("/Alarms/LowCellVoltage", 2 if blocked(cells, (0x01, 0xF0)) else 0)
-        self._set("/Alarms/HighTemperature", 2 if blocked(temps, (0x02, 0xF0)) else 0)
-        self._set("/Alarms/LowTemperature", 2 if blocked(temps, (0x01, 0xF0)) else 0)
+        for path, value in publications(analog, alarm):
+            self._set(path, value)
 
     def poll(self):
         self.ticks += 1
@@ -268,13 +279,19 @@ def port_path(argument):
 
 
 def main():
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+    from vedbus import VeDbusService
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     port = port_path(sys.argv[1] if len(sys.argv) > 1 else "")
     DBusGMainLoop(set_as_default=True)
-    battery = Battery(port)
+    name = "com.victronenergy.battery." + os.path.basename(port)
+    service = VeDbusService(name, register=False)
+    battery = Battery(port, service, device_instance())
     GLib.timeout_add(POLL_MS, battery.poll)
     GLib.MainLoop().run()
 

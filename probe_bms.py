@@ -131,38 +131,26 @@ def self_check():
     _check_driver()
 
 
-def _stub_driver_imports():
-    """dbus, gi, and vedbus are not on the build machine. Battery.__new__ never builds a service."""
-    import types
+class _Paths:
+    """Enough of VeDbusService for the publish check. add_path is startup, not a poll write."""
 
-    if "dbus_bluenova" in sys.modules:
-        return
-    glib = types.ModuleType("dbus.mainloop.glib")
-    glib.DBusGMainLoop = object
-    mainloop = types.ModuleType("dbus.mainloop")
-    mainloop.glib = glib
-    dbus = types.ModuleType("dbus")
-    dbus.mainloop = mainloop
-    repository = types.ModuleType("gi.repository")
-    repository.GLib = object
-    gi = types.ModuleType("gi")
-    gi.repository = repository
-    vedbus = types.ModuleType("vedbus")
-    vedbus.VeDbusService = object
-    sys.modules["dbus"] = dbus
-    sys.modules["dbus.mainloop"] = mainloop
-    sys.modules["dbus.mainloop.glib"] = glib
-    sys.modules["gi"] = gi
-    sys.modules["gi.repository"] = repository
-    sys.modules["vedbus"] = vedbus
+    def __init__(self):
+        self.rows = []
+
+    def add_path(self, path, value):
+        return None
+
+    def register(self):
+        return None
+
+    def __setitem__(self, path, value):
+        self.rows.append((path, value))
 
 
 def _check_driver():
     """Publish gate, cell-index guard, and a 0x51 miss that must not look like a dead link."""
-    _stub_driver_imports()
     import dbus_bluenova
 
-    dbus_bluenova._identity_miss_logged = False
     wire = bytes.fromhex(
         "01100CF40CEF0CF00CF60CF10CF00CF60CF20CED0CF70CF60CEC0CF20CF50CF00CF1"
         "070B9C0B9B0B9E0B9C0BCF0BCF0BB1FEA514B5251A04271000FC5F640000"
@@ -185,18 +173,6 @@ def _check_driver():
         "/Alarms/LowTemperature",
         "/Alarms/HighTemperature",
     )
-    rows = []
-    battery = dbus_bluenova.Battery.__new__(dbus_bluenova.Battery)
-
-    def record(path, value):
-        rows.append((path, value))
-
-    battery._set = record
-
-    def phase(alarm, sample=analog):
-        start = len(rows)
-        battery.apply(sample, alarm)
-        return rows[start:]
 
     def require_measurements(entries, label):
         got = dict(entries)
@@ -213,9 +189,9 @@ def _check_driver():
             if path in limit_paths:
                 raise SystemExit(f"{label} wrote {path}={value}")
 
-    require_measurements(phase(None), "missing alarm")
-    require_measurements(phase({"cells": [], "temps": []}), "empty alarm")
-    healthy = phase({"cells": [0] * 16, "temps": [0] * 7})
+    require_measurements(dbus_bluenova.publications(analog, None), "missing alarm")
+    require_measurements(dbus_bluenova.publications(analog, {"cells": [], "temps": []}), "empty alarm")
+    healthy = dbus_bluenova.publications(analog, {"cells": [0] * 16, "temps": [0] * 7})
     got = dict(healthy)
     expected = {
         "/Info/MaxChargeCurrent": 50.0,
@@ -236,11 +212,7 @@ def _check_driver():
     voltage_at = order.index("/Info/MaxChargeVoltage")
     if order.index("/Info/MaxChargeCurrent") > voltage_at or order.index("/Info/MaxDischargeCurrent") > voltage_at:
         raise SystemExit(f"current limits followed charge voltage: {order}")
-    require_measurements(phase(None), "alarm gap")
-    start = len(rows)
-    battery.mark_down()
-    if rows[start:] != [("/Connected", 0)]:
-        raise SystemExit(f"mark_down wrote {rows[start:]}")
+    require_measurements(dbus_bluenova.publications(analog, None), "alarm gap")
 
     cases = (
         ("cells", 0x02, 0, 100.0),
@@ -255,7 +227,7 @@ def _check_driver():
     for where, code, charge, discharge in cases:
         alarm = {"cells": [0] * 16, "temps": [0] * 7}
         alarm[where][0] = code
-        got = dict(phase(alarm))
+        got = dict(dbus_bluenova.publications(analog, alarm))
         if got.get("/Info/MaxChargeCurrent") != charge or got.get("/Info/MaxDischargeCurrent") != discharge:
             raise SystemExit(
                 f"{where} 0x{code:02X} wrote charge {got.get('/Info/MaxChargeCurrent')!r} "
@@ -264,18 +236,20 @@ def _check_driver():
 
     wide = dict(analog)
     wide["cells"] = [(index, 3000 + index) for index in range(1, 18)]
-    try:
-        tail = phase({"cells": [0] * 16, "temps": [0]}, wide)
-    except Exception as exc:
-        raise SystemExit(f"17 cells raised {exc}")
+    tail = dbus_bluenova.publications(wide, {"cells": [0] * 16, "temps": [0]})
     if ("/Voltages/Cell1", 3.001) not in tail or ("/Voltages/Cell16", 3.016) not in tail:
         raise SystemExit(f"cell guard dropped a published cell: {tail}")
     if any(path == "/Voltages/Cell17" for path, _ in tail):
         raise SystemExit("cell 17 was published")
 
+    service = _Paths()
+    battery = dbus_bluenova.Battery("/dev/unused", service, 0)
+    battery.mark_down()
+    if service.rows != [("/Connected", 0)]:
+        raise SystemExit(f"mark_down wrote {service.rows}")
+
     script = {"identity": "raise"}
     closed = []
-    downed = []
 
     def fail_open():
         raise SystemExit("poll opened a serial port")
@@ -292,10 +266,8 @@ def _check_driver():
         raise SystemExit(f"driver sent 0x{cid2:02X}")
 
     battery.fd = "sentinel"
-    battery.ticks = 0
     battery.open = fail_open
     battery.close = lambda: closed.append(True)
-    battery.mark_down = lambda: downed.append(True)
     battery.ask = ask
     notes = []
 
@@ -315,22 +287,20 @@ def _check_driver():
             battery.fails = 2
             battery.named = False
             closed.clear()
-            downed.clear()
-            start = len(rows)
+            start = len(service.rows)
             if battery.poll() is not True:
                 raise SystemExit("poll did not return true")
             if battery.fails != 0:
                 raise SystemExit(f"identity miss counted as a link failure: {battery.fails}")
-            if closed or downed:
-                raise SystemExit("identity miss closed the port or marked the battery down")
+            if closed:
+                raise SystemExit("identity miss closed the port")
             if battery.named:
                 raise SystemExit("identity miss set named")
-            tail = rows[start:]
+            tail = service.rows[start:]
             if ("/Dc/0/Voltage", voltage) not in tail:
                 raise SystemExit(f"poll did not publish voltage: {tail}")
-            for path, value in tail:
-                if path in limit_paths:
-                    raise SystemExit(f"poll with no alarm wrote {path}={value}")
+            if tail[-1:] == [("/Connected", 0)] or any(path in limit_paths for path, _ in tail):
+                raise SystemExit(f"poll with no alarm wrote limits or marked down: {tail}")
     finally:
         dbus_bluenova.log.warning = previous
     soft = [line for line in notes if line == "identity reply missing or did not decode"]
