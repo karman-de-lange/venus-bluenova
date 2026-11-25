@@ -128,6 +128,216 @@ def self_check():
     if modbus_read(1, 0, 1) != bytes.fromhex("010300000001840A"):
         raise SystemExit("modbus crc check failed")
     pylon.self_check()
+    _check_driver()
+
+
+def _stub_driver_imports():
+    """dbus, gi, and vedbus are not on the build machine. Battery.__new__ never builds a service."""
+    import types
+
+    if "dbus_bluenova" in sys.modules:
+        return
+    glib = types.ModuleType("dbus.mainloop.glib")
+    glib.DBusGMainLoop = object
+    mainloop = types.ModuleType("dbus.mainloop")
+    mainloop.glib = glib
+    dbus = types.ModuleType("dbus")
+    dbus.mainloop = mainloop
+    repository = types.ModuleType("gi.repository")
+    repository.GLib = object
+    gi = types.ModuleType("gi")
+    gi.repository = repository
+    vedbus = types.ModuleType("vedbus")
+    vedbus.VeDbusService = object
+    sys.modules["dbus"] = dbus
+    sys.modules["dbus.mainloop"] = mainloop
+    sys.modules["dbus.mainloop.glib"] = glib
+    sys.modules["gi"] = gi
+    sys.modules["gi.repository"] = repository
+    sys.modules["vedbus"] = vedbus
+
+
+def _check_driver():
+    """Publish gate, cell-index guard, and a 0x51 miss that must not look like a dead link."""
+    _stub_driver_imports()
+    import dbus_bluenova
+
+    dbus_bluenova._identity_miss_logged = False
+    wire = bytes.fromhex(
+        "01100CF40CEF0CF00CF60CF10CF00CF60CF20CED0CF70CF60CEC0CF20CF50CF00CF1"
+        "070B9C0B9B0B9E0B9C0BCF0BCF0BB1FEA514B5251A04271000FC5F640000"
+    ).hex().upper().encode()
+    analog = pylon.decode_analog(wire)
+    if analog is None:
+        raise SystemExit("documented analog did not decode for the driver check")
+    voltage = round(analog["voltage"], 2)
+    current = round(analog["current"], 2)
+    soc = int(analog["soc"])
+    limit_paths = (
+        "/Info/MaxChargeVoltage",
+        "/Info/MaxChargeCurrent",
+        "/Info/MaxDischargeCurrent",
+        "/Info/BatteryLowVoltage",
+        "/Io/AllowToCharge",
+        "/Io/AllowToDischarge",
+        "/Alarms/LowCellVoltage",
+        "/Alarms/HighCellVoltage",
+        "/Alarms/LowTemperature",
+        "/Alarms/HighTemperature",
+    )
+    rows = []
+    battery = dbus_bluenova.Battery.__new__(dbus_bluenova.Battery)
+
+    def record(path, value):
+        rows.append((path, value))
+
+    battery._set = record
+
+    def phase(alarm, sample=analog):
+        start = len(rows)
+        battery.apply(sample, alarm)
+        return rows[start:]
+
+    def require_measurements(entries, label):
+        got = dict(entries)
+        expected = {
+            "/Dc/0/Voltage": voltage,
+            "/Dc/0/Current": current,
+            "/Soc": soc,
+            "/Connected": 1,
+        }
+        for path, value in expected.items():
+            if got.get(path) != value:
+                raise SystemExit(f"{label} did not publish {path}={value}: {entries}")
+        for path, value in entries:
+            if path in limit_paths:
+                raise SystemExit(f"{label} wrote {path}={value}")
+
+    require_measurements(phase(None), "missing alarm")
+    require_measurements(phase({"cells": [], "temps": []}), "empty alarm")
+    healthy = phase({"cells": [0] * 16, "temps": [0] * 7})
+    got = dict(healthy)
+    expected = {
+        "/Info/MaxChargeCurrent": 50.0,
+        "/Info/MaxDischargeCurrent": 100.0,
+        "/Info/BatteryLowVoltage": 46.5,
+        "/Info/MaxChargeVoltage": 55.0,
+        "/Io/AllowToCharge": 1,
+        "/Io/AllowToDischarge": 1,
+        "/Alarms/LowCellVoltage": 0,
+        "/Alarms/HighCellVoltage": 0,
+        "/Alarms/LowTemperature": 0,
+        "/Alarms/HighTemperature": 0,
+    }
+    for path, value in expected.items():
+        if got.get(path) != value:
+            raise SystemExit(f"healthy alarm wrote {path}={got.get(path)!r}, want {value!r}")
+    order = [path for path, _ in healthy]
+    voltage_at = order.index("/Info/MaxChargeVoltage")
+    if order.index("/Info/MaxChargeCurrent") > voltage_at or order.index("/Info/MaxDischargeCurrent") > voltage_at:
+        raise SystemExit(f"current limits followed charge voltage: {order}")
+    require_measurements(phase(None), "alarm gap")
+    start = len(rows)
+    battery.mark_down()
+    if rows[start:] != [("/Connected", 0)]:
+        raise SystemExit(f"mark_down wrote {rows[start:]}")
+
+    cases = (
+        ("cells", 0x02, 0, 100.0),
+        ("temps", 0x02, 0, 100.0),
+        ("cells", 0x01, 50.0, 0),
+        ("temps", 0x01, 50.0, 0),
+        ("cells", 0xF0, 0, 0),
+        ("temps", 0xF0, 0, 0),
+        ("cells", 0x03, 50.0, 100.0),
+        ("temps", 0x03, 50.0, 100.0),
+    )
+    for where, code, charge, discharge in cases:
+        alarm = {"cells": [0] * 16, "temps": [0] * 7}
+        alarm[where][0] = code
+        got = dict(phase(alarm))
+        if got.get("/Info/MaxChargeCurrent") != charge or got.get("/Info/MaxDischargeCurrent") != discharge:
+            raise SystemExit(
+                f"{where} 0x{code:02X} wrote charge {got.get('/Info/MaxChargeCurrent')!r} "
+                f"discharge {got.get('/Info/MaxDischargeCurrent')!r}"
+            )
+
+    wide = dict(analog)
+    wide["cells"] = [(index, 3000 + index) for index in range(1, 18)]
+    try:
+        tail = phase({"cells": [0] * 16, "temps": [0]}, wide)
+    except Exception as exc:
+        raise SystemExit(f"17 cells raised {exc}")
+    if ("/Voltages/Cell1", 3.001) not in tail or ("/Voltages/Cell16", 3.016) not in tail:
+        raise SystemExit(f"cell guard dropped a published cell: {tail}")
+    if any(path == "/Voltages/Cell17" for path, _ in tail):
+        raise SystemExit("cell 17 was published")
+
+    script = {"identity": "raise"}
+    closed = []
+    downed = []
+
+    def fail_open():
+        raise SystemExit("poll opened a serial port")
+
+    def ask(cid2, info=b""):
+        if cid2 == 0x42:
+            return {"rtn": 0x00, "info": wire}
+        if cid2 == 0x44:
+            return None
+        if cid2 == 0x51:
+            if script["identity"] == "raise":
+                raise TimeoutError("identity timeout")
+            return script["identity"]
+        raise SystemExit(f"driver sent 0x{cid2:02X}")
+
+    battery.fd = "sentinel"
+    battery.ticks = 0
+    battery.open = fail_open
+    battery.close = lambda: closed.append(True)
+    battery.mark_down = lambda: downed.append(True)
+    battery.ask = ask
+    notes = []
+
+    def note(message, *args, **kwargs):
+        notes.append(message % args if args else message)
+
+    previous = dbus_bluenova.log.warning
+    dbus_bluenova.log.warning = note
+    try:
+        identities = (
+            "raise",
+            None,
+            {"rtn": 0x00, "info": b"short"},
+        )
+        for identity in identities:
+            script["identity"] = identity
+            battery.fails = 2
+            battery.named = False
+            closed.clear()
+            downed.clear()
+            start = len(rows)
+            if battery.poll() is not True:
+                raise SystemExit("poll did not return true")
+            if battery.fails != 0:
+                raise SystemExit(f"identity miss counted as a link failure: {battery.fails}")
+            if closed or downed:
+                raise SystemExit("identity miss closed the port or marked the battery down")
+            if battery.named:
+                raise SystemExit("identity miss set named")
+            tail = rows[start:]
+            if ("/Dc/0/Voltage", voltage) not in tail:
+                raise SystemExit(f"poll did not publish voltage: {tail}")
+            for path, value in tail:
+                if path in limit_paths:
+                    raise SystemExit(f"poll with no alarm wrote {path}={value}")
+    finally:
+        dbus_bluenova.log.warning = previous
+    soft = [line for line in notes if line == "identity reply missing or did not decode"]
+    if len(soft) != 1:
+        raise SystemExit(f"soft identity miss was logged {len(soft)} times: {notes}")
+    if not any(line.startswith("identity read failed:") for line in notes):
+        raise SystemExit(f"identity timeout was not logged: {notes}")
 
 
 def ensure_access(port):
@@ -368,6 +578,20 @@ def run_pass(port, baud, rts_mode, probes, log):
         os.close(fd)
 
 
+def alarm_findings(info):
+    states = pylon.decode_alarm(info)
+    if not states:
+        return []
+    findings = []
+    for index, state in enumerate(states["cells"], start=1):
+        if state:
+            findings.append(f"cell {index} {pylon.level_name(state)}")
+    for index, state in enumerate(states["temps"], start=1):
+        if state:
+            findings.append(f"temperature sensor {index} {pylon.level_name(state)}")
+    return findings
+
+
 def deepen(port, parsed):
     """Once a protocol answers, read the analog block and the alarm block."""
     baud = parsed["baud"]
@@ -408,8 +632,10 @@ def deepen(port, parsed):
                     "protections": [],
                     "status": [],
                 }
+            else:
+                report["protocol"] = "Pylon/Pace ASCII"
             if alarm and alarm[0]["rtn"] == 0x00:
-                findings = pylon.alarm_findings(alarm[0]["info"])
+                findings = alarm_findings(alarm[0]["info"])
                 report["warnings"] = findings
             if analog:
                 report["analog_rtn"] = analog[0]["rtn"]

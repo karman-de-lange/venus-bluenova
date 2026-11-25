@@ -1,7 +1,7 @@
 """Pylon RS485 frames for this BlueNova rack, and the port they travel on.
 
-One layout. CID2 0x42 and 0x44 are walked from their count bytes. CID2 0x51
-is raw ASCII, so a frame whose INFO is not hex is kept as text.
+One layout. parse keeps INFO as the ASCII bytes from the wire. CID2 0x42 and
+0x44 are hex and are decoded from their count bytes. CID2 0x51 stays raw text.
 """
 
 import os
@@ -49,7 +49,7 @@ def frame(version, address, cid2, info=b"", cid1=0x46):
 
 
 def parse(response):
-    """Return checksum-valid frames. Hex INFO is decoded. Raw text INFO is kept."""
+    """Return checksum-valid frames. INFO is the ASCII bytes that were on the wire."""
     frames = []
     start = 0
     while True:
@@ -74,18 +74,11 @@ def parse(response):
             cid1 = int(body[4:6], 16)
             rtn = int(body[6:8], 16)
             length = int(body[8:12], 16) & 0x0FFF
-            info_ascii = body[12:]
+            info = body[12:]
         except ValueError:
             continue
-        if len(info_ascii) != length:
+        if len(info) != length:
             continue
-        if not info_ascii:
-            info = b""
-        else:
-            try:
-                info = bytes.fromhex(info_ascii.decode())
-            except ValueError:
-                info = bytes(info_ascii)
         frames.append(
             {
                 "kind": "pylon",
@@ -93,11 +86,19 @@ def parse(response):
                 "address": address,
                 "cid1": cid1,
                 "rtn": rtn,
-                "info": info,
+                "info": bytes(info),
                 "raw": raw,
             }
         )
     return frames
+
+
+def _info_bytes(info):
+    """0x42 and 0x44 carry ASCII hex. Identity text is not passed through here."""
+    try:
+        return bytes.fromhex(info.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def decode_analog(info):
@@ -105,7 +106,8 @@ def decode_analog(info):
 
     The byte after remaining capacity is one fixed byte. It is not a length.
     """
-    if len(info) < 4:
+    info = _info_bytes(info)
+    if info is None or len(info) < 4:
         return None
     cell_count = info[1]
     cursor = 2
@@ -142,7 +144,6 @@ def decode_analog(info):
     soc = info[cursor]
     soh = info[cursor + 1]
     return {
-        "protocol": "Pylon/Pace ASCII",
         "current": current,
         "voltage": voltage,
         "soc": soc,
@@ -152,9 +153,6 @@ def decode_analog(info):
         "cycles": cycles,
         "cells": [(index + 1, millivolts) for index, millivolts in enumerate(cells)],
         "temps": temps,
-        "warnings": [],
-        "protections": [],
-        "status": [],
     }
 
 
@@ -163,7 +161,8 @@ def decode_alarm(info):
 
     The bytes after the temperature states are not charge-control flags.
     """
-    if len(info) < 4:
+    info = _info_bytes(info)
+    if info is None or len(info) < 4:
         return None
     cell_count = info[1]
     cursor = 2
@@ -177,20 +176,6 @@ def decode_alarm(info):
         return None
     temps = list(info[cursor : cursor + temp_count])
     return {"cells": cells, "temps": temps}
-
-
-def alarm_findings(info):
-    states = decode_alarm(info)
-    if not states:
-        return []
-    findings = []
-    for index, state in enumerate(states["cells"], start=1):
-        if state:
-            findings.append(f"cell {index} {level_name(state)}")
-    for index, state in enumerate(states["temps"], start=1):
-        if state:
-            findings.append(f"temperature sensor {index} {level_name(state)}")
-    return findings
 
 
 def decode_identity(info):
@@ -294,14 +279,27 @@ def strip_echo(request, response):
 
 
 def self_check():
-    """The captured 0x42 frame, including one that the old two-offset parser misread."""
+    """Captured frames. 0x42 and 0x44 INFO is wire ASCII; decode hex-decodes it."""
     documented = bytes.fromhex(
         "01100CF40CEF0CF00CF60CF10CF00CF60CF20CED0CF70CF60CEC0CF20CF50CF00CF1"
         "070B9C0B9B0B9E0B9C0BCF0BCF0BB1FEA514B5251A04271000FC5F640000"
     )
-    got = decode_analog(documented)
+    wire = documented.hex().upper().encode()
+    measurements = {
+        "current",
+        "voltage",
+        "soc",
+        "soh",
+        "remain_ah",
+        "full_ah",
+        "cycles",
+        "cells",
+        "temps",
+    }
+    got = decode_analog(wire)
     if (
         got is None
+        or set(got) != measurements
         or got["voltage"] != 53.01
         or got["soc"] != 95
         or round(got["current"], 2) != -3.47
@@ -312,18 +310,33 @@ def self_check():
         "01100d080d0a0d050d070d0a0d080d070d090d090d090d0a0d090d070d080d0a0d09"
         "070bac0bab0baf0bab0bdb0bdb0bb9005f14d920f3042710010554640000"
     )
-    got = decode_analog(shifted)
+    got = decode_analog(shifted.hex().upper().encode())
     if got is None or round(got["voltage"], 2) != 53.37 or got["soc"] != 84 or len(got["cells"]) != 16:
         raise SystemExit(f"live analog frame decoded wrong: {got}")
-    alarm = bytes.fromhex("0110" + "00" * 16 + "07" + "00" * 7 + "0000080006400000000000")
+    alarm = ("0110" + "00" * 16 + "07" + "00" * 7 + "0000080006400000000000").encode()
     states = decode_alarm(alarm)
     if states != {"cells": [0] * 16, "temps": [0] * 7}:
         raise SystemExit(f"alarm frame decoded wrong: {states}")
-    # 0x42 INFO is hex on the wire. 0x51 INFO is raw text and must stay that way.
-    parsed = parse(frame(0x21, 1, 0x00, documented.hex().upper().encode()))
-    if not parsed or parsed[0]["info"] != documented:
-        raise SystemExit("hex INFO did not round-trip")
+    # Wire INFO is ASCII hex. A fromhex failure must not fall back to raw bytes.
+    if decode_analog(documented) is not None or decode_alarm(bytes.fromhex(alarm.decode())) is not None:
+        raise SystemExit("decoder walked raw bytes instead of wire ASCII")
+    parsed = parse(frame(0x21, 1, 0x00, wire))
+    if not parsed or parsed[0]["info"] != wire:
+        raise SystemExit(f"hex INFO did not round-trip as wire ASCII: {parsed}")
+    got = decode_analog(parsed[0]["info"])
+    if (
+        got is None
+        or got["voltage"] != 53.01
+        or got["soc"] != 95
+        or round(got["current"], 2) != -3.47
+        or len(got["cells"]) != 16
+    ):
+        raise SystemExit(f"hex INFO did not decode: {got}")
     identity = b"TB-48100-CAN" + b" " * 8 + b"BN07Topband"
     parsed = parse(frame(0x21, 1, 0x51, identity))
-    if not parsed or decode_identity(parsed[0]["info"]) != ("TB-48100-CAN", "BN07", "Topband"):
+    if (
+        not parsed
+        or parsed[0]["info"] != identity
+        or decode_identity(parsed[0]["info"]) != ("TB-48100-CAN", "BN07", "Topband")
+    ):
         raise SystemExit(f"identity frame decoded wrong: {parsed}")

@@ -8,8 +8,8 @@ forces the matching current to zero. The 0x47 protection ceiling is not used.
 
 Unknown measurements stay invalid. A zero on /Info/MaxDischargeCurrent is a
 command to stop the inverter, and /Info/MaxChargeVoltage is what makes Venus
-treat this service as the controlling BMS. Neither is published until a real
-frame has been decoded. A lost reply does not send that stop command.
+treat this service as the controlling BMS. Those limits stay unpublished until
+an alarm frame has been decoded. A lost reply does not send that stop command.
 """
 
 import logging
@@ -35,6 +35,8 @@ FAILS_BEFORE_DOWN = 3
 POLL_MS = 1000
 
 log = logging.getLogger("bluenova")
+# A soft 0x51 miss repeats every poll until the pack answers. Warn once.
+_identity_miss_logged = False
 
 
 def blocked(states, codes):
@@ -150,19 +152,28 @@ class Battery:
         return None
 
     def apply_name(self):
-        frame = self.ask(0x51)
-        found = pylon.decode_identity(frame["info"]) if frame else None
-        if not found:
-            return
-        model, project, maker = found
-        self._set("/HardwareVersion", f"{model} {project}".strip())
-        self._set("/Serial", f"{model}-{project}" if project else model)
-        if maker:
-            self._set("/Manufacturer", maker)
-        self.named = True
-        log.info("pack %s %s %s", model, project, maker)
+        # Called after measurements are on dbus. A missed name must not look
+        # like a dead link or undo that publish.
+        global _identity_miss_logged
+        try:
+            frame = self.ask(0x51)
+            found = pylon.decode_identity(frame["info"]) if frame else None
+            if not found:
+                if not _identity_miss_logged:
+                    _identity_miss_logged = True
+                    log.warning("identity reply missing or did not decode")
+                return
+            model, project, maker = found
+            self._set("/HardwareVersion", f"{model} {project}".strip())
+            self._set("/Serial", f"{model}-{project}" if project else model)
+            if maker:
+                self._set("/Manufacturer", maker)
+            self.named = True
+            log.info("pack %s %s %s", model, project, maker)
+        except Exception as exc:
+            log.warning("identity read failed: %s", exc)
 
-    def apply(self, analog, cells, temps):
+    def apply(self, analog, alarm):
         voltage = analog["voltage"]
         current = analog["current"]
         remain = analog["remain_ah"]
@@ -177,8 +188,10 @@ class Battery:
         self._set("/ConsumedAmphours", round(max(0.0, full - remain), 2))
         self._set("/History/ChargeCycles", int(analog["cycles"]))
         millivolts = [value for _, value in analog["cells"]]
+        # Paths exist only for cells 1..16. A longer count must not KeyError.
         for index, value in analog["cells"]:
-            self._set(f"/Voltages/Cell{index}", round(value / 1000.0, 3))
+            if 1 <= index <= 16:
+                self._set(f"/Voltages/Cell{index}", round(value / 1000.0, 3))
         if millivolts:
             self._set("/System/MinCellVoltage", round(min(millivolts) / 1000.0, 3))
             self._set("/System/MaxCellVoltage", round(max(millivolts) / 1000.0, 3))
@@ -187,22 +200,28 @@ class Battery:
             self._set("/Dc/0/Temperature", round(max(probes), 1))
             self._set("/System/MinCellTemperature", round(min(probes), 1))
             self._set("/System/MaxCellTemperature", round(max(probes), 1))
-        charge_ok = not blocked(cells, (0x02, 0xF0)) and not blocked(temps, (0x02, 0xF0))
-        discharge_ok = not blocked(cells, (0x01, 0xF0)) and not blocked(temps, (0x01, 0xF0))
-        self._set("/Io/AllowToCharge", 1 if charge_ok else 0)
-        self._set("/Io/AllowToDischarge", 1 if discharge_ok else 0)
+        self._set("/Connected", 1)
+        # No decoded states is not a healthy pack. Leave limits and alarm
+        # paths alone so startup stays invalid and a gap cannot command 0 A.
+        if alarm is None or not alarm.get("cells"):
+            return
+        cells = alarm["cells"]
+        temps = alarm["temps"]
+        charge_block = blocked(cells, (0x02, 0xF0)) or blocked(temps, (0x02, 0xF0))
+        discharge_block = blocked(cells, (0x01, 0xF0)) or blocked(temps, (0x01, 0xF0))
+        self._set("/Io/AllowToCharge", 0 if charge_block else 1)
+        self._set("/Io/AllowToDischarge", 0 if discharge_block else 1)
         # Currents first. Venus starts using this service as the BMS when
         # MaxChargeVoltage becomes valid, and a discharge current of 0 turns
         # the inverter off.
-        self._set("/Info/MaxChargeCurrent", CHARGE_CURRENT if charge_ok else 0)
-        self._set("/Info/MaxDischargeCurrent", DISCHARGE_CURRENT if discharge_ok else 0)
+        self._set("/Info/MaxChargeCurrent", 0 if charge_block else CHARGE_CURRENT)
+        self._set("/Info/MaxDischargeCurrent", 0 if discharge_block else DISCHARGE_CURRENT)
         self._set("/Info/BatteryLowVoltage", LOW_VOLTAGE)
         self._set("/Info/MaxChargeVoltage", CHARGE_VOLTAGE)
         self._set("/Alarms/HighCellVoltage", 2 if blocked(cells, (0x02, 0xF0)) else 0)
         self._set("/Alarms/LowCellVoltage", 2 if blocked(cells, (0x01, 0xF0)) else 0)
         self._set("/Alarms/HighTemperature", 2 if blocked(temps, (0x02, 0xF0)) else 0)
         self._set("/Alarms/LowTemperature", 2 if blocked(temps, (0x01, 0xF0)) else 0)
-        self._set("/Connected", 1)
 
     def poll(self):
         self.ticks += 1
@@ -210,19 +229,17 @@ class Battery:
             if self.fd is None:
                 self.open()
             analog_frame = self.ask(0x42, b"01")
-            alarm_frame = self.ask(0x44, b"01")
             if analog_frame is None:
                 raise TimeoutError("no analog reply")
             analog = pylon.decode_analog(analog_frame["info"])
             if analog is None:
                 raise ValueError("analog payload did not decode")
-            states = pylon.decode_alarm(alarm_frame["info"]) if alarm_frame else None
-            cells = states["cells"] if states else []
-            temps = states["temps"] if states else []
+            alarm_frame = self.ask(0x44, b"01")
+            alarm = pylon.decode_alarm(alarm_frame["info"]) if alarm_frame else None
+            self.apply(analog, alarm)
+            self.fails = 0
             if not self.named:
                 self.apply_name()
-            self.apply(analog, cells, temps)
-            self.fails = 0
             if self.ticks % 60 == 1:
                 log.info(
                     "%.2f V %+.2f A SOC %s%% cells %s",
