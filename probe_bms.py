@@ -414,7 +414,7 @@ def decode_pylon_analog(info):
         for index in range(cell_count):
             pos = offset + index * 2
             cells.append((body[pos] << 8) | body[pos + 1])
-        if not any(2000 <= cell <= 4500 for cell in cells):
+        if any(cell < 2000 or cell > 4500 for cell in cells):
             continue
         cursor = offset + cell_count * 2
         if cursor >= len(body):
@@ -436,6 +436,10 @@ def decode_pylon_analog(info):
         cursor += 2
         # Under 10000 the rack is reporting 10 mV steps (52.62 V is 0x148E).
         voltage = voltage_raw / 100.0 if voltage_raw < 10000 else voltage_raw / 1000.0
+        # A one-byte shift still leaves a few values inside the cell range.
+        # The pack voltage is the sum of the cells, so the shift cannot pass.
+        if abs(sum(cells) / 1000.0 - voltage) > 1.5:
+            continue
         remain = None
         full = None
         cycles = None
