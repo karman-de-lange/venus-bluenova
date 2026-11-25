@@ -12,20 +12,14 @@ Usage:
 
 import argparse
 import os
-import select
 import shlex
 import sys
-import termios
 import time
+
+import pylon
 
 PORT_DEFAULT = "/dev/ttyUSB0"
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe-log.txt")
-
-BAUD_CONST = {
-    9600: termios.B9600,
-    19200: termios.B19200,
-    115200: termios.B115200,
-}
 
 # Pace Modbus register 9. Same positions are used for register 10, except
 # where the protection list below overrides the name.
@@ -77,12 +71,6 @@ PACE_STATUS_BITS = (
     (15, "heater on"),
 )
 
-PYLON_LEVEL = {
-    0x00: "normal",
-    0x01: "below lower limit",
-    0x02: "above upper limit",
-    0xF0: "other fault",
-}
 PYLON_RTN = {
     0x00: "ok",
     0x01: "version error",
@@ -130,32 +118,16 @@ def modbus_read(slave, start, count, function=0x03):
     return body + bytes((crc & 0xFF, (crc >> 8) & 0xFF))
 
 
-def pylon_length(info):
-    """LENGTH field: high nibble is the checksum of the 12-bit ASCII length."""
-    length = len(info)
-    if length == 0:
-        return 0
-    total = (length & 0xF) + ((length >> 4) & 0xF) + ((length >> 8) & 0xF)
-    check = (0x10 - (total % 16)) & 0xF
-    return (check << 12) | length
-
-
-def pylon_frame(version, address, cid2, info=b"", cid1=0x46):
-    body = f"{version:02X}{address:02X}{cid1:02X}{cid2:02X}{pylon_length(info):04X}".encode()
-    body += info
-    checksum = (-sum(body)) & 0xFFFF
-    return b"~" + body + f"{checksum:04X}".encode() + b"\r"
-
-
 def self_check():
     # Pace ASCII alarm read, address 2, from the Pace protocol example.
     expected = bytes.fromhex("7E3235303234363434453030323032464432430D")
-    got = pylon_frame(0x25, 0x02, 0x44, b"02")
+    got = pylon.frame(0x25, 0x02, 0x44, b"02")
     if got != expected:
         raise SystemExit(f"frame check failed: {got.hex()} != {expected.hex()}")
     # Modbus read holding register 0, one register, slave 1.
     if modbus_read(1, 0, 1) != bytes.fromhex("010300000001840A"):
         raise SystemExit("modbus crc check failed")
+    pylon.self_check()
 
 
 def ensure_access(port):
@@ -176,98 +148,8 @@ def ensure_access(port):
         os.close(fd)
 
 
-def set_rts(fd, on):
-    import array
-    import fcntl
-
-    flags = array.array("i", [0])
-    fcntl.ioctl(fd, termios.TIOCMGET, flags)
-    if on:
-        flags[0] |= termios.TIOCM_RTS
-    else:
-        flags[0] &= ~termios.TIOCM_RTS
-    fcntl.ioctl(fd, termios.TIOCMSET, flags)
-
-
-def open_port(port, baud):
-    fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
-    attrs = termios.tcgetattr(fd)
-    speed = BAUD_CONST[baud]
-    attrs[0] = 0
-    attrs[1] = 0
-    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL | speed
-    attrs[3] = 0
-    attrs[4] = speed
-    attrs[5] = speed
-    attrs[6][termios.VMIN] = 0
-    attrs[6][termios.VTIME] = 0
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
-    termios.tcflush(fd, termios.TCIOFLUSH)
-    return fd
-
-
-def write_all(fd, payload):
-    view = payload
-    while view:
-        sent = os.write(fd, view)
-        view = view[sent:]
-    termios.tcdrain(fd)
-
-
-def read_response(fd, request, overall, quiet):
-    """Read a reply. For a '~' request, wait until the reply's carriage return.
-
-    A 160-byte frame at 9600 baud takes about 170 ms and arrives in USB
-    packets, so a short silence is not the end of the frame. The request
-    itself ends in CR, and some adapters echo it, so the CR that matters
-    is the one after that echo.
-    """
-    data = bytearray()
-    deadline = time.monotonic() + overall
-    pylon = request[:1] == b"~"
-    while time.monotonic() < deadline:
-        wait = deadline - time.monotonic()
-        ready, _, _ = select.select([fd], [], [], wait)
-        if not ready:
-            break
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            break
-        data += chunk
-        payload = bytes(data)
-        if payload.startswith(request):
-            payload = payload[len(request) :]
-        if pylon and b"\r" in payload:
-            break
-        if not pylon and data:
-            deadline = min(deadline, time.monotonic() + quiet)
-    return bytes(data)
-
-
-def transact(fd, payload, rts_mode, overall=1.0):
-    termios.tcflush(fd, termios.TCIFLUSH)
-    if rts_mode == "rts":
-        set_rts(fd, True)
-    elif rts_mode == "inv":
-        set_rts(fd, False)
-    write_all(fd, payload)
-    if rts_mode == "rts":
-        set_rts(fd, False)
-    elif rts_mode == "inv":
-        set_rts(fd, True)
-    # Modbus replies are short. Pylon analog replies are ~150 bytes at 9600.
-    quiet = 0.08 if payload[:1] != b"~" else 0.2
-    return read_response(fd, payload, overall, quiet)
-
-
-def strip_echo(request, response):
-    if response.startswith(request):
-        return response[len(request) :]
-    return response
-
-
 def parse_modbus(request, response):
-    response = strip_echo(request, response)
+    response = pylon.strip_echo(request, response)
     slave = request[0]
     function = request[1]
     for index in range(max(0, len(response) - 4)):
@@ -298,55 +180,6 @@ def parse_modbus(request, response):
     return None
 
 
-def parse_pylon(response):
-    frames = []
-    start = 0
-    while True:
-        begin = response.find(b"~", start)
-        if begin < 0:
-            return frames
-        end = response.find(b"\r", begin)
-        if end < 0:
-            return frames
-        raw = response[begin : end + 1]
-        start = end + 1
-        body = raw[1:-5]
-        try:
-            checksum = int(raw[-5:-1], 16)
-        except ValueError:
-            continue
-        if ((-sum(body)) & 0xFFFF) != checksum or len(body) < 12:
-            continue
-        try:
-            version = int(body[0:2], 16)
-            address = int(body[2:4], 16)
-            cid1 = int(body[4:6], 16)
-            rtn = int(body[6:8], 16)
-            length = int(body[8:12], 16) & 0x0FFF
-            info_ascii = body[12:]
-            info = bytes.fromhex(info_ascii.decode()) if info_ascii else b""
-        except ValueError:
-            continue
-        if len(info_ascii) != length:
-            continue
-        frames.append(
-            {
-                "kind": "pylon",
-                "version": version,
-                "address": address,
-                "cid1": cid1,
-                "rtn": rtn,
-                "info": info,
-                "raw": raw,
-            }
-        )
-    return frames
-
-
-def signed16(value):
-    return value - 0x10000 if value & 0x8000 else value
-
-
 def looks_like_pack(voltage, cells):
     live = [cell for cell in cells if 2000 <= cell <= 4500]
     return 30.0 <= voltage <= 70.0 and len(live) >= 8
@@ -355,7 +188,7 @@ def looks_like_pack(voltage, cells):
 def decode_pace(words):
     if len(words) < 13:
         return None
-    current = signed16(words[0]) * 0.01
+    current = pylon.signed16(words[0]) * 0.01
     voltage = words[1] * 0.01
     cells = list(words[15:31]) if len(words) >= 31 else []
     if not looks_like_pack(voltage, cells or [int(voltage / 16 * 1000)] * 8):
@@ -365,7 +198,7 @@ def decode_pace(words):
         if raw in (0x0000, 0x7FFF, 0xFFFF):
             temps.append(None)
         else:
-            temps.append(signed16(raw) * 0.1)
+            temps.append(pylon.signed16(raw) * 0.1)
     live_cells = [(index + 1, millivolts) for index, millivolts in enumerate(cells) if millivolts]
     return {
         "protocol": "Pace Modbus",
@@ -386,99 +219,6 @@ def decode_pace(words):
         "cells": live_cells,
         "temps": temps,
     }
-
-
-def level_name(value):
-    return PYLON_LEVEL.get(value, f"0x{value:02X}")
-
-
-def decode_pylon_analog(info):
-    """CID2 0x42 for this rack. One layout, walked from the count bytes.
-
-    Byte 0 is the address echo. Byte 1 is the cell count. There is no
-    module-count byte in front of that. The byte after remaining capacity
-    is one fixed byte, not a length.
-    """
-    if len(info) < 4:
-        return None
-    cell_count = info[1]
-    cursor = 2
-    if cell_count < 1 or cursor + cell_count * 2 >= len(info):
-        return None
-    cells = []
-    for _ in range(cell_count):
-        cells.append((info[cursor] << 8) | info[cursor + 1])
-        cursor += 2
-    temp_count = info[cursor]
-    cursor += 1
-    # current, voltage, remain, the fixed byte, full, cycles, SOC, SOH
-    tail = temp_count * 2 + 13
-    if cursor + tail > len(info):
-        return None
-    temps = []
-    for _ in range(temp_count):
-        raw = (info[cursor] << 8) | info[cursor + 1]
-        cursor += 2
-        temps.append(round((signed16(raw) - 2730) / 10.0, 1))
-    current = signed16((info[cursor] << 8) | info[cursor + 1]) / 100.0
-    cursor += 2
-    voltage_raw = (info[cursor] << 8) | info[cursor + 1]
-    cursor += 2
-    # Under 10000 the rack is reporting 10 mV steps (52.62 V is 0x148E).
-    voltage = voltage_raw / 100.0 if voltage_raw < 10000 else voltage_raw / 1000.0
-    remain = ((info[cursor] << 8) | info[cursor + 1]) / 100.0
-    cursor += 3
-    full = ((info[cursor] << 8) | info[cursor + 1]) / 100.0
-    cursor += 2
-    cycles = (info[cursor] << 8) | info[cursor + 1]
-    cursor += 2
-    soc = info[cursor]
-    soh = info[cursor + 1]
-    return {
-        "protocol": "Pylon/Pace ASCII",
-        "current": current,
-        "voltage": voltage,
-        "soc": soc,
-        "soh": soh,
-        "remain_ah": remain,
-        "full_ah": full,
-        "cycles": cycles,
-        "cells": [(index + 1, millivolts) for index, millivolts in enumerate(cells)],
-        "temps": temps,
-        "warnings": [],
-        "protections": [],
-        "status": [],
-    }
-
-
-def decode_pylon_alarm(info):
-    """Cell and temperature states from a 44H alarm payload."""
-    findings = []
-    for skip in (1, 0):
-        body = info[skip:]
-        if len(body) < 4:
-            continue
-        cell_count = body[1] if body[0] <= 16 and 1 <= body[1] <= 16 else body[0]
-        offset = 2 if cell_count == body[1] else 1
-        if not 1 <= cell_count <= 16 or len(body) < offset + cell_count:
-            continue
-        states = body[offset : offset + cell_count]
-        if not any(state in PYLON_LEVEL for state in states):
-            continue
-        for index, state in enumerate(states, start=1):
-            if state:
-                findings.append(f"cell {index} {level_name(state)}")
-        cursor = offset + cell_count
-        if cursor < len(body):
-            temp_count = body[cursor]
-            cursor += 1
-            if 0 < temp_count <= 8 and cursor + temp_count <= len(body):
-                for index, state in enumerate(body[cursor : cursor + temp_count], start=1):
-                    if state:
-                        findings.append(f"temperature sensor {index} {level_name(state)}")
-                cursor += temp_count
-        return findings
-    return None
 
 
 def cell_summary(cells):
@@ -569,7 +309,7 @@ def probe_list():
     This rack answered protocol version 0x21 at address 1, 9600 8N1.
     """
     items = []
-    items.append(("pylon", "v21 addr 1 analog", pylon_frame(0x21, 1, 0x42, b"01")))
+    items.append(("pylon", "v21 addr 1 analog", pylon.frame(0x21, 1, 0x42, b"01")))
     for slave in (1, 2, 3):
         items.append(("modbus", f"slave {slave} holding 0..36", modbus_read(slave, 0, 37)))
     for version in (0x21, 0x20, 0x25):
@@ -579,19 +319,19 @@ def probe_list():
                 (
                     "pylon",
                     f"v{version:02X} addr {address} analog",
-                    pylon_frame(version, address, 0x42, info),
+                    pylon.frame(version, address, 0x42, info),
                 )
             )
             items.append(
                 (
                     "pylon",
                     f"v{version:02X} addr {address} alarm",
-                    pylon_frame(version, address, 0x44, info),
+                    pylon.frame(version, address, 0x44, info),
                 )
             )
     for version in (0x21, 0x20, 0x25):
-        items.append(("pylon", f"v{version:02X} system analog", pylon_frame(version, 2, 0x61)))
-        items.append(("pylon", f"v{version:02X} system alarm", pylon_frame(version, 2, 0x62)))
+        items.append(("pylon", f"v{version:02X} system analog", pylon.frame(version, 2, 0x61)))
+        items.append(("pylon", f"v{version:02X} system alarm", pylon.frame(version, 2, 0x62)))
     items.append(("modbus", "slave 1 input 0..16", modbus_read(1, 0, 17, function=0x04)))
     return items
 
@@ -599,17 +339,17 @@ def probe_list():
 def classify(kind, request, response):
     if kind == "modbus":
         return parse_modbus(request, response)
-    frames = parse_pylon(strip_echo(request, response))
+    frames = pylon.parse(pylon.strip_echo(request, response))
     return frames[0] if frames else None
 
 
 def run_pass(port, baud, rts_mode, probes, log):
-    fd = open_port(port, baud)
+    fd = pylon.open_port(port, baud)
     found = []
     try:
         for kind, label, request in probes:
-            response = transact(fd, request, rts_mode)
-            response = strip_echo(request, response)
+            response = pylon.transact(fd, request, rts_mode)
+            response = pylon.strip_echo(request, response)
             if not response:
                 continue
             parsed = classify(kind, request, response)
@@ -631,11 +371,11 @@ def run_pass(port, baud, rts_mode, probes, log):
 def deepen(port, parsed):
     """Once a protocol answers, read the analog block and the alarm block."""
     baud = parsed["baud"]
-    fd = open_port(port, baud)
+    fd = pylon.open_port(port, baud)
     try:
         if parsed["kind"] == "modbus":
             request = modbus_read(parsed["slave"], 0, 37)
-            response = transact(fd, request, parsed.get("rts", "auto"), overall=0.6)
+            response = pylon.transact(fd, request, parsed.get("rts", "auto"), overall=0.6)
             got = parse_modbus(request, response)
             if not got:
                 return None
@@ -649,14 +389,14 @@ def deepen(port, parsed):
             version = parsed["version"]
             address = parsed["address"]
             info = f"{address:02X}".encode()
-            analog_req = pylon_frame(version, address, 0x42, info)
-            alarm_req = pylon_frame(version, address, 0x44, info)
+            analog_req = pylon.frame(version, address, 0x42, info)
+            alarm_req = pylon.frame(version, address, 0x44, info)
             mode = parsed.get("rts", "auto")
-            analog = parse_pylon(strip_echo(analog_req, transact(fd, analog_req, mode, 0.6)))
-            alarm = parse_pylon(strip_echo(alarm_req, transact(fd, alarm_req, mode, 0.6)))
+            analog = pylon.parse(pylon.strip_echo(analog_req, pylon.transact(fd, analog_req, mode, 0.6)))
+            alarm = pylon.parse(pylon.strip_echo(alarm_req, pylon.transact(fd, alarm_req, mode, 0.6)))
             report = None
             if analog and analog[0]["rtn"] == 0x00:
-                report = decode_pylon_analog(analog[0]["info"])
+                report = pylon.decode_analog(analog[0]["info"])
             if report is None:
                 report = {
                     "protocol": "Pylon/Pace ASCII",
@@ -669,7 +409,7 @@ def deepen(port, parsed):
                     "status": [],
                 }
             if alarm and alarm[0]["rtn"] == 0x00:
-                findings = decode_pylon_alarm(alarm[0]["info"]) or []
+                findings = pylon.alarm_findings(alarm[0]["info"])
                 report["warnings"] = findings
             if analog:
                 report["analog_rtn"] = analog[0]["rtn"]

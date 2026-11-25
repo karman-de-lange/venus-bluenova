@@ -5,6 +5,11 @@ Read-only on the wire. Polls Pylon-family commands 0x42 and 0x44. The pack
 does not report a charge target, so the DVCC limits are the RacPower manual
 values: 55.0 V, 50 A charge, 100 A discharge, 46.5 V low. An alarm byte
 forces the matching current to zero. The 0x47 protection ceiling is not used.
+
+Unknown measurements stay invalid. A zero on /Info/MaxDischargeCurrent is a
+command to stop the inverter, and /Info/MaxChargeVoltage is what makes Venus
+treat this service as the controlling BMS. Neither is published until a real
+frame has been decoded. A lost reply does not send that stop command.
 """
 
 import logging
@@ -19,7 +24,7 @@ from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 from vedbus import VeDbusService
 
-import probe_bms as bms
+import pylon
 
 VERSION = "1.0"
 CHARGE_VOLTAGE = 55.0
@@ -32,39 +37,19 @@ POLL_MS = 1000
 log = logging.getLogger("bluenova")
 
 
-def identity(fd):
-    """CID2 0x51 is raw ASCII, so the hex decoder in the probe cannot read it."""
-    request = bms.pylon_frame(0x21, 1, 0x51)
-    raw = bms.strip_echo(request, bms.transact(fd, request, "auto", 1.0))
-    begin = raw.find(b"~")
-    end = raw.find(b"\r", begin + 1)
-    if begin < 0 or end < 0 or end < begin + 16:
-        return None
-    info = raw[begin + 13 : end - 4]
-    if len(info) < 24:
-        return None
-    text = info.decode("ascii", "replace")
-    model = text[:20].strip()
-    project = text[20:24].strip()
-    maker = text[24:].strip()
-    if not model:
-        return None
-    return model, project, maker
-
-
-def alarm_states(info):
-    """Return (cell states, temperature states) from a 0x44 payload."""
-    if len(info) < 4 or info[0] != 0x01 or info[1] != 16:
-        return None
-    cells = list(info[2:18])
-    temps = []
-    if len(info) > 18 and info[18] == 7 and len(info) >= 26:
-        temps = list(info[19:26])
-    return cells, temps
-
-
 def blocked(states, codes):
     return any(state in codes for state in states)
+
+
+def cell_summary(cells):
+    if not cells:
+        return "no cell voltages"
+    low = min(cells, key=lambda item: item[1])
+    high = max(cells, key=lambda item: item[1])
+    return (
+        f"{len(cells)} cells, {low[1]} mV (cell {low[0]}) to "
+        f"{high[1]} mV (cell {high[0]}), spread {high[1] - low[1]} mV"
+    )
 
 
 class Battery:
@@ -104,22 +89,24 @@ class Battery:
         add("/Serial", "")
         add("/Manufacturer", "Topband")
         add("/Connected", 0)
-        add("/Soc", 0)
-        add("/Soh", 0)
-        add("/Capacity", 0)
-        add("/InstalledCapacity", 100)
-        add("/ConsumedAmphours", 0)
-        add("/History/ChargeCycles", 0)
-        add("/Dc/0/Voltage", 0)
-        add("/Dc/0/Current", 0)
-        add("/Dc/0/Power", 0)
+        add("/Soc", None)
+        add("/Soh", None)
+        add("/Capacity", None)
+        add("/InstalledCapacity", None)
+        add("/ConsumedAmphours", None)
+        add("/History/ChargeCycles", None)
+        add("/Dc/0/Voltage", None)
+        add("/Dc/0/Current", None)
+        add("/Dc/0/Power", None)
         add("/Dc/0/Temperature", None)
-        add("/Info/MaxChargeVoltage", CHARGE_VOLTAGE)
-        add("/Info/MaxChargeCurrent", 0)
-        add("/Info/MaxDischargeCurrent", 0)
-        add("/Info/BatteryLowVoltage", LOW_VOLTAGE)
-        add("/Io/AllowToCharge", 0)
-        add("/Io/AllowToDischarge", 0)
+        # MaxChargeVoltage is what makes systemcalc select this service as the
+        # BMS. Leave it invalid until apply() has real current limits to go with it.
+        add("/Info/MaxChargeVoltage", None)
+        add("/Info/MaxChargeCurrent", None)
+        add("/Info/MaxDischargeCurrent", None)
+        add("/Info/BatteryLowVoltage", None)
+        add("/Io/AllowToCharge", None)
+        add("/Io/AllowToDischarge", None)
         add("/System/MinCellVoltage", None)
         add("/System/MaxCellVoltage", None)
         add("/System/MinCellTemperature", None)
@@ -139,11 +126,9 @@ class Battery:
         self.service[path] = value
 
     def mark_down(self):
+        # Connected=0 tells the GUI the link is down. The current limits stay
+        # at the last real values. Writing 0 there would stop the inverter.
         self._set("/Connected", 0)
-        self._set("/Info/MaxChargeCurrent", 0)
-        self._set("/Info/MaxDischargeCurrent", 0)
-        self._set("/Io/AllowToCharge", 0)
-        self._set("/Io/AllowToDischarge", 0)
 
     def close(self):
         if self.fd is not None:
@@ -151,21 +136,22 @@ class Battery:
             self.fd = None
 
     def open(self):
-        self.fd = bms.open_port(self.port, 9600)
+        self.fd = pylon.open_port(self.port, 9600)
         self.named = False
         log.info("opened %s at 9600 8N1", self.port)
 
     def ask(self, cid2, info=b""):
-        request = bms.pylon_frame(0x21, 1, cid2, info)
-        raw = bms.transact(self.fd, request, "auto", 1.0)
-        frames = bms.parse_pylon(bms.strip_echo(request, raw))
+        request = pylon.frame(0x21, 1, cid2, info)
+        raw = pylon.transact(self.fd, request, "auto", 1.0)
+        frames = pylon.parse(pylon.strip_echo(request, raw))
         for frame in frames:
             if frame["rtn"] == 0x00:
                 return frame
         return None
 
     def apply_name(self):
-        found = identity(self.fd)
+        frame = self.ask(0x51)
+        found = pylon.decode_identity(frame["info"]) if frame else None
         if not found:
             return
         model, project, maker = found
@@ -179,18 +165,17 @@ class Battery:
     def apply(self, analog, cells, temps):
         voltage = analog["voltage"]
         current = analog["current"]
-        remain = analog["remain_ah"] if analog["remain_ah"] is not None else 0.0
-        full = analog["full_ah"] if analog["full_ah"] is not None else 100.0
+        remain = analog["remain_ah"]
+        full = analog["full_ah"]
         self._set("/Dc/0/Voltage", round(voltage, 2))
         self._set("/Dc/0/Current", round(current, 2))
         self._set("/Dc/0/Power", round(voltage * current, 1))
-        self._set("/Soc", int(analog["soc"] if analog["soc"] is not None else 0))
-        self._set("/Soh", int(analog["soh"] if analog["soh"] is not None else 0))
+        self._set("/Soc", int(analog["soc"]))
+        self._set("/Soh", int(analog["soh"]))
         self._set("/Capacity", round(remain, 2))
         self._set("/InstalledCapacity", round(full, 2))
         self._set("/ConsumedAmphours", round(max(0.0, full - remain), 2))
-        if analog["cycles"] is not None:
-            self._set("/History/ChargeCycles", int(analog["cycles"]))
+        self._set("/History/ChargeCycles", int(analog["cycles"]))
         millivolts = [value for _, value in analog["cells"]]
         for index, value in analog["cells"]:
             self._set(f"/Voltages/Cell{index}", round(value / 1000.0, 3))
@@ -206,10 +191,13 @@ class Battery:
         discharge_ok = not blocked(cells, (0x01, 0xF0)) and not blocked(temps, (0x01, 0xF0))
         self._set("/Io/AllowToCharge", 1 if charge_ok else 0)
         self._set("/Io/AllowToDischarge", 1 if discharge_ok else 0)
+        # Currents first. Venus starts using this service as the BMS when
+        # MaxChargeVoltage becomes valid, and a discharge current of 0 turns
+        # the inverter off.
         self._set("/Info/MaxChargeCurrent", CHARGE_CURRENT if charge_ok else 0)
         self._set("/Info/MaxDischargeCurrent", DISCHARGE_CURRENT if discharge_ok else 0)
-        self._set("/Info/MaxChargeVoltage", CHARGE_VOLTAGE)
         self._set("/Info/BatteryLowVoltage", LOW_VOLTAGE)
+        self._set("/Info/MaxChargeVoltage", CHARGE_VOLTAGE)
         self._set("/Alarms/HighCellVoltage", 2 if blocked(cells, (0x02, 0xF0)) else 0)
         self._set("/Alarms/LowCellVoltage", 2 if blocked(cells, (0x01, 0xF0)) else 0)
         self._set("/Alarms/HighTemperature", 2 if blocked(temps, (0x02, 0xF0)) else 0)
@@ -225,11 +213,12 @@ class Battery:
             alarm_frame = self.ask(0x44, b"01")
             if analog_frame is None:
                 raise TimeoutError("no analog reply")
-            analog = bms.decode_pylon_analog(analog_frame["info"])
+            analog = pylon.decode_analog(analog_frame["info"])
             if analog is None:
                 raise ValueError("analog payload did not decode")
-            states = alarm_states(alarm_frame["info"]) if alarm_frame else None
-            cells, temps = states if states else ([], [])
+            states = pylon.decode_alarm(alarm_frame["info"]) if alarm_frame else None
+            cells = states["cells"] if states else []
+            temps = states["temps"] if states else []
             if not self.named:
                 self.apply_name()
             self.apply(analog, cells, temps)
@@ -240,7 +229,7 @@ class Battery:
                     analog["voltage"],
                     analog["current"],
                     analog["soc"],
-                    bms.cell_summary(analog["cells"]),
+                    cell_summary(analog["cells"]),
                 )
         except Exception as exc:
             self.fails += 1
